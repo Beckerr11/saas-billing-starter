@@ -1,4 +1,5 @@
 import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto'
+import { createMockBillingProvider } from './providers/billingProvider.js'
 
 const PLAN_CATALOG = [
   { id: 'starter', amountInCents: 4900, currency: 'BRL' },
@@ -17,6 +18,10 @@ export function createStore() {
 
 export function listPlans() {
   return PLAN_CATALOG.map((plan) => ({ ...plan }))
+}
+
+function findPlan(planId) {
+  return PLAN_CATALOG.find((item) => item.id === planId)
 }
 
 export function signWebhookPayload(rawBody, webhookSecret) {
@@ -61,7 +66,7 @@ export function createCheckoutSession(store, { workspaceId, planId }) {
     throw new Error('workspace nao encontrado')
   }
 
-  const plan = PLAN_CATALOG.find((item) => item.id === planId)
+  const plan = findPlan(planId)
   if (!plan) {
     throw new Error('plano invalido')
   }
@@ -187,6 +192,7 @@ function parseJson(rawBody) {
 
 export function createApp(store = createStore(), options = {}) {
   const webhookSecret = options.webhookSecret || process.env.BILLING_WEBHOOK_SECRET || 'dev-webhook-secret'
+  const billingProvider = options.billingProvider || createMockBillingProvider()
 
   return async function app(req, res) {
     const url = new URL(req.url || '/', 'http://localhost')
@@ -212,14 +218,38 @@ export function createApp(store = createStore(), options = {}) {
       if (req.method === 'POST' && url.pathname === '/billing/checkout') {
         const payload = parseJson(await readBody(req))
         const checkout = createCheckoutSession(store, payload)
-        sendJson(res, 201, { checkout })
+        const providerSession = await billingProvider.createCheckoutSession({
+          sessionId: checkout.sessionId,
+          workspaceId: payload.workspaceId,
+          planId: payload.planId,
+          amountInCents: checkout.amountInCents,
+          currency: checkout.currency,
+        })
+        sendJson(res, 201, {
+          checkout: {
+            ...checkout,
+            provider: providerSession.provider,
+            checkoutUrl: providerSession.checkoutUrl || checkout.checkoutUrl,
+            externalSessionId: providerSession.externalSessionId || null,
+          },
+        })
         return
       }
 
       if (req.method === 'POST' && url.pathname === '/billing/portal') {
         const payload = parseJson(await readBody(req))
         const portal = createBillingPortalSession(store, payload)
-        sendJson(res, 200, { portal })
+        const providerPortal = await billingProvider.createBillingPortalSession({
+          workspaceId: payload.workspaceId,
+          planId: portal.planId,
+        })
+        sendJson(res, 200, {
+          portal: {
+            ...portal,
+            provider: providerPortal.provider,
+            portalUrl: providerPortal.portalUrl || portal.portalUrl,
+          },
+        })
         return
       }
 

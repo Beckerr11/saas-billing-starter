@@ -10,6 +10,7 @@ import {
   signWebhookPayload,
   verifyWebhookSignature,
 } from '../src/app.js'
+import { createMockBillingProvider } from '../src/providers/billingProvider.js'
 
 test('billing flow creates active subscription after signed checkout webhook', () => {
   const store = createStore()
@@ -52,4 +53,13 @@ test('webhook is idempotent by event id', () => {
   assert.equal(first.duplicate, false)
   assert.equal(second.duplicate, true)
   assert.equal(listSubscriptions(store).length, 1)
+})
+
+test('mock billing provider exposes predictable URLs', async () => {
+  const provider = createMockBillingProvider()
+  const checkout = await provider.createCheckoutSession({ sessionId: 'sess-123' })
+  const portal = await provider.createBillingPortalSession({ workspaceId: 'ws-1' })
+
+  assert.ok(checkout.checkoutUrl.includes('sess-123'))
+  assert.ok(portal.portalUrl.includes('ws-1'))
 })

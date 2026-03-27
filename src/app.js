@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto'
 
 const PLAN_CATALOG = [
   { id: 'starter', amountInCents: 4900, currency: 'BRL' },
@@ -11,11 +11,32 @@ export function createStore() {
     workspaces: [],
     checkoutSessions: [],
     subscriptions: [],
+    processedWebhookEvents: new Set(),
   }
 }
 
 export function listPlans() {
   return PLAN_CATALOG.map((plan) => ({ ...plan }))
+}
+
+export function signWebhookPayload(rawBody, webhookSecret) {
+  return createHmac('sha256', webhookSecret).update(rawBody).digest('hex')
+}
+
+export function verifyWebhookSignature(rawBody, signature, webhookSecret) {
+  if (!signature || !webhookSecret) {
+    return false
+  }
+
+  const expected = signWebhookPayload(rawBody, webhookSecret)
+  const left = Buffer.from(expected)
+  const right = Buffer.from(String(signature))
+
+  if (left.length !== right.length) {
+    return false
+  }
+
+  return timingSafeEqual(left, right)
 }
 
 export function createWorkspace(store, { name, ownerEmail }) {
@@ -64,13 +85,22 @@ export function createCheckoutSession(store, { workspaceId, planId }) {
   }
 }
 
-export function processBillingWebhook(store, { type, sessionId }) {
-  const session = store.checkoutSessions.find((item) => item.id === sessionId)
+export function processBillingWebhook(store, event) {
+  const eventId = String(event.eventId || '').trim()
+  if (!eventId) {
+    throw new Error('eventId obrigatorio')
+  }
+
+  if (store.processedWebhookEvents.has(eventId)) {
+    return { duplicate: true, eventId }
+  }
+
+  const session = store.checkoutSessions.find((item) => item.id === event.sessionId)
   if (!session) {
     throw new Error('sessao nao encontrada')
   }
 
-  if (type === 'checkout.completed') {
+  if (event.type === 'checkout.completed') {
     session.status = 'completed'
 
     const existing = store.subscriptions.find((item) => item.workspaceId === session.workspaceId && item.status === 'active')
@@ -88,20 +118,38 @@ export function processBillingWebhook(store, { type, sessionId }) {
     }
 
     store.subscriptions.push(subscription)
-    return subscription
+    store.processedWebhookEvents.add(eventId)
+
+    return { duplicate: false, eventId, subscription }
   }
 
-  if (type === 'subscription.canceled') {
+  if (event.type === 'subscription.canceled') {
     const active = store.subscriptions.find((item) => item.workspaceId === session.workspaceId && item.status === 'active')
     if (!active) {
       throw new Error('assinatura ativa nao encontrada')
     }
+
     active.status = 'canceled'
     active.canceledAt = new Date().toISOString()
-    return active
+    store.processedWebhookEvents.add(eventId)
+
+    return { duplicate: false, eventId, subscription: active }
   }
 
   throw new Error('evento nao suportado')
+}
+
+export function createBillingPortalSession(store, { workspaceId }) {
+  const active = store.subscriptions.find((item) => item.workspaceId === workspaceId && item.status === 'active')
+  if (!active) {
+    throw new Error('assinatura ativa nao encontrada para este workspace')
+  }
+
+  return {
+    workspaceId,
+    portalUrl: `https://billing.example.com/portal/${workspaceId}`,
+    planId: active.planId,
+  }
 }
 
 export function listSubscriptions(store) {
@@ -113,27 +161,33 @@ function sendJson(res, statusCode, payload) {
   res.end(JSON.stringify(payload))
 }
 
-function readJsonBody(req) {
+function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = []
     req.on('data', (chunk) => chunks.push(chunk))
     req.on('end', () => {
-      if (!chunks.length) {
-        resolve({})
-        return
-      }
-
-      try {
-        resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')))
-      } catch {
-        reject(new Error('JSON invalido'))
-      }
+      const raw = chunks.length ? Buffer.concat(chunks).toString('utf8') : ''
+      resolve(raw)
     })
     req.on('error', reject)
   })
 }
 
-export function createApp(store = createStore()) {
+function parseJson(rawBody) {
+  if (!rawBody) {
+    return {}
+  }
+
+  try {
+    return JSON.parse(rawBody)
+  } catch {
+    throw new Error('JSON invalido')
+  }
+}
+
+export function createApp(store = createStore(), options = {}) {
+  const webhookSecret = options.webhookSecret || process.env.BILLING_WEBHOOK_SECRET || 'dev-webhook-secret'
+
   return async function app(req, res) {
     const url = new URL(req.url || '/', 'http://localhost')
 
@@ -149,21 +203,36 @@ export function createApp(store = createStore()) {
       }
 
       if (req.method === 'POST' && url.pathname === '/workspaces') {
-        const payload = await readJsonBody(req)
+        const payload = parseJson(await readBody(req))
         const workspace = createWorkspace(store, payload)
         sendJson(res, 201, { workspace })
         return
       }
 
       if (req.method === 'POST' && url.pathname === '/billing/checkout') {
-        const payload = await readJsonBody(req)
+        const payload = parseJson(await readBody(req))
         const checkout = createCheckoutSession(store, payload)
         sendJson(res, 201, { checkout })
         return
       }
 
+      if (req.method === 'POST' && url.pathname === '/billing/portal') {
+        const payload = parseJson(await readBody(req))
+        const portal = createBillingPortalSession(store, payload)
+        sendJson(res, 200, { portal })
+        return
+      }
+
       if (req.method === 'POST' && url.pathname === '/billing/webhook') {
-        const payload = await readJsonBody(req)
+        const rawBody = await readBody(req)
+        const signature = req.headers['x-billing-signature']
+
+        if (!verifyWebhookSignature(rawBody, signature, webhookSecret)) {
+          sendJson(res, 401, { error: 'assinatura de webhook invalida' })
+          return
+        }
+
+        const payload = parseJson(rawBody)
         const result = processBillingWebhook(store, payload)
         sendJson(res, 200, { result })
         return

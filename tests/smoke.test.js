@@ -4,19 +4,52 @@ import {
   createStore,
   createWorkspace,
   createCheckoutSession,
+  createBillingPortalSession,
   processBillingWebhook,
   listSubscriptions,
+  signWebhookPayload,
+  verifyWebhookSignature,
 } from '../src/app.js'
 
-test('billing flow creates active subscription after checkout completed', () => {
+test('billing flow creates active subscription after signed checkout webhook', () => {
   const store = createStore()
   const workspace = createWorkspace(store, { name: 'Acme', ownerEmail: 'owner@acme.com' })
   const checkout = createCheckoutSession(store, { workspaceId: workspace.id, planId: 'growth' })
 
-  processBillingWebhook(store, { type: 'checkout.completed', sessionId: checkout.sessionId })
+  const payload = JSON.stringify({
+    eventId: 'evt-1',
+    type: 'checkout.completed',
+    sessionId: checkout.sessionId,
+  })
+  const signature = signWebhookPayload(payload, 'test-secret')
+
+  assert.equal(verifyWebhookSignature(payload, signature, 'test-secret'), true)
+
+  processBillingWebhook(store, JSON.parse(payload))
 
   const subscriptions = listSubscriptions(store)
   assert.equal(subscriptions.length, 1)
   assert.equal(subscriptions[0].status, 'active')
-  assert.equal(subscriptions[0].planId, 'growth')
+
+  const portal = createBillingPortalSession(store, { workspaceId: workspace.id })
+  assert.ok(portal.portalUrl.includes(workspace.id))
+})
+
+test('webhook is idempotent by event id', () => {
+  const store = createStore()
+  const workspace = createWorkspace(store, { name: 'Beta', ownerEmail: 'owner@beta.com' })
+  const checkout = createCheckoutSession(store, { workspaceId: workspace.id, planId: 'starter' })
+
+  const event = {
+    eventId: 'evt-duplicate',
+    type: 'checkout.completed',
+    sessionId: checkout.sessionId,
+  }
+
+  const first = processBillingWebhook(store, event)
+  const second = processBillingWebhook(store, event)
+
+  assert.equal(first.duplicate, false)
+  assert.equal(second.duplicate, true)
+  assert.equal(listSubscriptions(store).length, 1)
 })

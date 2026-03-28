@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: saas-billing-starter
+    runtime: node
+    plan: free
+    autoDeploy: true
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: BILLING_WEBHOOK_SECRET
+        sync: false
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_SUCCESS_URL
+        value: https://example.com/success
+      - key: STRIPE_CANCEL_URL
+        value: https://example.com/cancel

@@ -1,5 +1,8 @@
+import { buildLandingHtml } from './ui/landing.js'
 import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto'
 import { createMockBillingProvider } from './providers/billingProvider.js'
+
+const MAX_BODY_SIZE_BYTES = 1_000_000
 
 const PLAN_CATALOG = [
   { id: 'starter', amountInCents: 4900, currency: 'BRL' },
@@ -169,7 +172,16 @@ function sendJson(res, statusCode, payload) {
 function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = []
-    req.on('data', (chunk) => chunks.push(chunk))
+    let totalSize = 0
+    req.on('data', (chunk) => {
+      totalSize += chunk.length
+      if (totalSize > MAX_BODY_SIZE_BYTES) {
+        reject(new Error('payload excede limite de 1MB'))
+        req.destroy()
+        return
+      }
+      chunks.push(chunk)
+    })
     req.on('end', () => {
       const raw = chunks.length ? Buffer.concat(chunks).toString('utf8') : ''
       resolve(raw)
@@ -198,6 +210,12 @@ export function createApp(store = createStore(), options = {}) {
     const url = new URL(req.url || '/', 'http://localhost')
 
     try {
+            if (req.method === 'GET' && url.pathname === '/') {
+        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+        res.end(buildLandingHtml())
+        return
+      }
+
       if (req.method === 'GET' && url.pathname === '/health') {
         sendJson(res, 200, { ok: true, service: 'saas-billing-starter' })
         return
@@ -279,3 +297,5 @@ export function createApp(store = createStore(), options = {}) {
     }
   }
 }
+
+
